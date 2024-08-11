@@ -9,12 +9,7 @@ import copy
 from typing import List, Dict, Optional, Literal, Tuple
 from PIL import Image
 
-from marker.convert import convert_single_pdf
-from marker.models import load_all_models
-from marker.output import markdown_exists, save_markdown
-from marker.settings import settings
-from datasets.utils.logging import disable_progress_bar
-from marker.pdf.utils import replace_langs_with_codes, validate_langs, find_filetype
+from marker.pdf.utils import validate_langs, find_filetype, replace_langs_with_codes
 from marker.pdf.extract_text import get_text_blocks
 from marker.ocr.recognition import run_ocr
 from marker.layout.layout import annotate_block_types
@@ -26,13 +21,15 @@ from marker.cleaners.code import identify_code_blocks, indent_blocks
 from marker.cleaners.bullets import replace_bullets
 from marker.cleaners.headings import split_heading_blocks
 from marker.cleaners.fontstyle import find_bold_italic
+from marker.cleaners.text import cleanup_text
 from marker.postprocessors.editor import edit_full_text
 from marker.postprocessors.markdown import merge_spans, merge_lines, get_full_text
-from marker.cleaners.text import cleanup_text
 from marker.images.extract import extract_images
 from marker.images.save import images_to_dict
-
-# New imports for enhanced features
+from marker.convert import convert_single_pdf
+from marker.models import load_all_models
+from marker.output import markdown_exists, save_markdown
+from marker.settings import settings
 from marker.title_page import generate_title_page
 from marker.toc import generate_table_of_contents
 from marker.citations import extract_citations, format_citations
@@ -40,6 +37,8 @@ from marker.document_structure import analyze_structure, apply_template
 from marker.content_enhancement import summarize_section, improve_flow
 from marker.visual_integration import insert_visuals
 from marker.export import export_document
+
+from datasets.utils.logging import disable_progress_bar
 
 disable_progress_bar()
 
