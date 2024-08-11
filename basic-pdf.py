@@ -6,10 +6,10 @@ import time
 import requests
 import openai
 import copy
-from typing import List, Dict, Optional, Literal, Tuple
+from typing import List, Dict, Optional, Literal
 from PIL import Image
 
-import pypdfium2 as pdfium  # Needs to be imported early to avoid warnings
+import pypdfium2 as pdfium
 from marker.convert import convert_single_pdf
 from marker.models import load_all_models
 from marker.output import markdown_exists, save_markdown
@@ -19,19 +19,38 @@ from datasets.utils.logging import disable_progress_bar
 
 disable_progress_bar()
 
+# --- Model Data Processing Parameters ---
+DEFAULT_MODEL = "llama3-70b-8192"
+DEFAULT_REFERENCE_MODELS = [
+    "llama3-8b-8192",
+    "llama3-70b-8192",
+    "mixtral-8x7b-32768",
+    "gemma-7b-it",
+]
+DEFAULT_TEMPERATURE = 0.1
+DEFAULT_MAX_TOKENS = 2048
+
+# Model-specific rate limiting parameters (tokens per minute)
+MODEL_RATE_LIMITS = {
+    "llama3-70b-8192": 6000,
+    "llama3-8b-8192": 6000,
+    "mixtral-8x7b-32768": 5000,
+    "gemma-7b-it": 6000,
+}
+
+DELAY_BETWEEN_CALLS = 20  # seconds
+
+# Retry parameters
+MAX_RETRIES = 5
+BASE_WAIT = 1  # seconds
+MAX_WAIT = 60  # seconds
+
 # --- Constants and Setup ---
 DEBUG = int(os.environ.get("DEBUG", "0"))
 
 # Load API keys from Streamlit secrets
 OPENAI_API_KEY = st.secrets["openai"]["OPENAI_API_KEY"]
 GROQ_API_KEY = st.secrets["groq"]["GROQ_API_KEY"]
-
-default_reference_models = [
-    "llama3-8b-8192",
-    "llama3-70b-8192",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
-]
 
 LANGUAGE_TO_TESSERACT_CODE = {
     "Afrikaans": "afr",
@@ -131,89 +150,89 @@ LANGUAGE_TO_TESSERACT_CODE = {
 
 TESSERACT_CODE_TO_LANGUAGE = {v: k for k, v in LANGUAGE_TO_TESSERACT_CODE.items()}
 
+# --- Rate Limiting Helper ---
+def rate_limit(model):
+    """Delays the execution to respect the rate limit of the model."""
+    limit = MODEL_RATE_LIMITS.get(model)
+    if limit:
+        time.sleep(60 / limit)
+
+# --- Retry Helper ---
+def retry_with_backoff(func, *args, **kwargs):
+    """Retries a function call with exponential backoff."""
+    num_retries = 0
+    wait_time = BASE_WAIT
+    while num_retries < MAX_RETRIES:
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            st.error(f"Error: {e}. Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+            num_retries += 1
+            wait_time = min(wait_time * 2, MAX_WAIT)
+    st.error(f"Failed after {MAX_RETRIES} retries. Giving up.")
+    return None
+
 # --- MoA Functions ---
 def generate_together(
     model,
     messages,
-    max_tokens=2048,
-    temperature=0.1,
+    max_tokens=DEFAULT_MAX_TOKENS,
+    temperature=DEFAULT_TEMPERATURE,
     streaming=False,
 ):
-    output = None
-    for sleep_time in [1, 2, 4, 8, 16, 32]:
-        try:
-            endpoint = "https://api.groq.com/openai/v1/chat/completions"
-            if DEBUG:
-                st.write(
-                    f"Sending messages ({len(messages)}) (last message: `{messages[-1]['content'][:20]}...`) to `{model}`."
-                )
-            res = requests.post(
-                endpoint,
-                json={
-                    "model": model,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature if temperature > 1e-4 else 0,
-                    "messages": messages,
-                },
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            )
-            if "error" in res.json():
-                st.write(res.json())
-                if res.json()["error"]["type"] == "invalid_request_error":
-                    st.write("Input + output is longer than max_position_id.")
-                    return None
-            output = res.json()["choices"][0]["message"]["content"]
-            break
-        except Exception as e:
-            st.write(e)
-            if DEBUG:
-                st.write(f"Msgs: `{messages}`")
-            st.write(f"Retry in {sleep_time}s..")
-            time.sleep(sleep_time)
+    rate_limit(model)
+    output = retry_with_backoff(
+        requests.post,
+        "https://api.groq.com/openai/v1/chat/completions",
+        json={
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature if temperature > 1e-4 else 0,
+            "messages": messages,
+        },
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+    )
     if output is None:
-        return output
-    output = output.strip()
-    if DEBUG:
-        st.write(f"Output: `{output[:20]}...`.")
-    return output
+        return None
+    if "error" in output.json():
+        st.error(output.json())
+        if output.json()["error"]["type"] == "invalid_request_error":
+            st.write("Input + output is longer than max_position_id.")
+            return None
+    return output.json()["choices"][0]["message"]["content"].strip()
 
 
-def generate_together_stream(model, messages, max_tokens=2048, temperature=0.7):
+def generate_together_stream(
+    model,
+    messages,
+    max_tokens=DEFAULT_MAX_TOKENS,
+    temperature=DEFAULT_TEMPERATURE,
+):
+    rate_limit(model)  # Apply rate limiting
     endpoint = "https://api.groq.com/openai/v1/"
     client = openai.OpenAI(api_key=GROQ_API_KEY, base_url=endpoint)
-    endpoint = "https://api.groq.com/openai/v1/chat/completions"
     response = client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=temperature if temperature > 1e-4 else 0,
         max_tokens=max_tokens,
-        stream=True,  # this time, we set stream=True
+        stream=True,
     )
     return response
 
 
-def generate_openai(model, messages, max_tokens=2048, temperature=0.1):
+def generate_openai(model, messages, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE):
+    rate_limit(model)  # Apply rate limiting
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    for sleep_time in [1, 2, 4, 8, 16, 32]:
-        try:
-            if DEBUG:
-                st.write(
-                    f"Sending messages ({len(messages)}) (last message: `{messages[-1]['content'][:20]}`) to `{model}`."
-                )
-            completion = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            output = completion.choices[0].message.content
-            break
-        except Exception as e:
-            st.write(e)
-            st.write(f"Retry in {sleep_time}s..")
-            time.sleep(sleep_time)
-    output = output.strip()
-    return output
+    completion = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    output = completion.choices[0].message.content
+    return output.strip()
 
 
 def inject_references_to_messages(messages, references):
@@ -231,11 +250,11 @@ Responses from models:"""
 
 
 def generate_with_references(
-    model,
-    messages,
+    model=DEFAULT_MODEL,
+    messages=[],
     references=[],
-    max_tokens=2048,
-    temperature=0.1,
+    max_tokens=DEFAULT_MAX_TOKENS,
+    temperature=DEFAULT_TEMPERATURE,
     generate_fn=generate_together,
 ):
     if len(references) > 0:
@@ -249,14 +268,14 @@ def generate_with_references(
 
 # --- PDF Conversion Functions --- (from marker.convert)
 def convert_single_pdf(
-        fname: str,
-        model_lst: List,
-        max_pages: int = None,
-        start_page: int = None,
-        metadata: Optional[Dict] = None,
-        langs: Optional[List[str]] = None,
-        batch_multiplier: int = 1
-) -> Tuple[str, Dict[str, Image.Image], Dict]:
+    fname: str,
+    model_lst: List,
+    max_pages: int = None,
+    start_page: int = None,
+    metadata: Optional[Dict] = None,
+    langs: Optional[List[str]] = None,
+    batch_multiplier: int = 1,
+) -> tuple[str, Dict[str, Image.Image], Dict]:
     # Set language needed for OCR
     if langs is None:
         langs = [settings.DEFAULT_LANG]
@@ -285,12 +304,14 @@ def convert_single_pdf(
         doc,
         fname,
         max_pages=max_pages,
-        start_page=start_page
+        start_page=start_page,
     )
-    out_meta.update({
-        "toc": toc,
-        "pages": len(pages),
-    })
+    out_meta.update(
+        {
+            "toc": toc,
+            "pages": len(pages),
+        }
+    )
 
     # Trim pages from doc to align with start page
     if start_page:
@@ -305,7 +326,9 @@ def convert_single_pdf(
     flush_cuda_memory()
 
     # OCR pages as needed
-    pages, ocr_stats = run_ocr(doc, pages, langs, ocr_model, batch_multiplier=batch_multiplier)
+    pages, ocr_stats = run_ocr(
+        doc, pages, langs, ocr_model, batch_multiplier=batch_multiplier
+    )
     flush_cuda_memory()
 
     out_meta["ocr_stats"] = ocr_stats
@@ -402,15 +425,15 @@ uploaded_files = st.sidebar.file_uploader(
 
 # Language selection for OCR
 selected_languages = st.sidebar.multiselect(
-    'Select Languages for OCR',
+    "Select Languages for OCR",
     list(LANGUAGE_TO_TESSERACT_CODE.keys()),
-    ['English'] # Default language
+    ["English"],  # Default language
 )
 
 model_name = st.sidebar.selectbox(
     "Select Model",
     default_reference_models,
-    help="Select a model for report generation."
+    help="Select a model for report generation.",
 )
 
 # --- Main Content Area ---
@@ -425,7 +448,9 @@ if uploaded_files:
                 f.write(uploaded_file.getbuffer())
             with st.spinner(f"Converting {uploaded_file.name}..."):
                 full_text, images, out_metadata = convert_single_pdf(
-                    os.path.join(tmpdir, uploaded_file.name), model_lst, langs=selected_languages
+                    os.path.join(tmpdir, uploaded_file.name),
+                    model_lst,
+                    langs=selected_languages,
                 )
             pdf_content[uploaded_file.name] = full_text
 
@@ -442,26 +467,59 @@ if uploaded_files:
     if st.button("Generate Report"):
         if report_topic:
             with st.spinner("Generating report..."):
-                references = list(pdf_content.values())
+                # --- Process data through reference models ---
+                reference_outputs = []
+                for ref_model in DEFAULT_REFERENCE_MODELS:
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": f"Gather information about {report_topic} from the provided documents.",
+                        },
+                    ]
+                    ref_output = generate_with_references(
+                        model=ref_model,
+                        messages=messages,
+                        references=list(pdf_content.values()),  # Pass all PDF content
+                        generate_fn=generate_together
+                        if "groq" in ref_model
+                        else generate_openai,  # Select appropriate generate function
+                    )
+                    if ref_output:
+                        reference_outputs.append(ref_output)
+                    time.sleep(
+                        DELAY_BETWEEN_CALLS
+                    )  # Delay between calls to reference models
+
+                # --- Generate final report with default model ---
                 messages = [
-                    {"role": "user", "content": f"Create a structured report about {report_topic}, using the provided reference documents. Ensure to include citations and references."},
+                    {
+                        "role": "user",
+                        "content": f"Create a structured report about {report_topic}, using the information gathered. Ensure to include citations and references.",
+                    },
                 ]
                 report = generate_with_references(
-                    model=model_name, messages=messages, references=references
+                    model=DEFAULT_MODEL, messages=messages, references=reference_outputs
                 )
             st.markdown(report)
 
             # 3. Report Modification
             st.header("Report Modification")
-            modification_request = st.text_input("Enter your modification request (e.g., 'expand on XYZ topic'):")
+            modification_request = st.text_input(
+                "Enter your modification request (e.g., 'expand on XYZ topic'):"
+            )
             if st.button("Modify Report"):
                 if modification_request:
                     with st.spinner("Modifying report..."):
                         messages = [
-                            {"role": "user", "content": f"Here's the current report:\n\n{report}\n\n{modification_request}"}
+                            {
+                                "role": "user",
+                                "content": f"Here's the current report:\n\n{report}\n\n{modification_request}",
+                            }
                         ]
                         modified_report = generate_with_references(
-                            model=model_name, messages=messages, references=references
+                            model=DEFAULT_MODEL,
+                            messages=messages,
+                            references=references,
                         )
                     st.markdown(modified_report)
         else:
