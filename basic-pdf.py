@@ -10,7 +10,7 @@ import openai
 import copy
 
 from surya.languages import CODE_TO_LANGUAGE, LANGUAGE_TO_CODE
-from surya.model.recognition.tokenizer import tokenize as lang_tokenize
+# Removed direct import from surya
 from marker.ocr.tesseract import LANGUAGE_TO_TESSERACT_CODE, TESSERACT_CODE_TO_LANGUAGE
 from marker.settings import settings
 from marker.pdf.utils import replace_langs_with_codes, validate_langs, langs_to_ids
