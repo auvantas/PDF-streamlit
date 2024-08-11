@@ -9,8 +9,6 @@ import requests
 import openai
 import copy
 
-from surya.languages import CODE_TO_LANGUAGE, LANGUAGE_TO_CODE
-# Removed direct import from surya
 from marker.ocr.tesseract import LANGUAGE_TO_TESSERACT_CODE, TESSERACT_CODE_TO_LANGUAGE
 from marker.settings import settings
 from marker.pdf.utils import replace_langs_with_codes, validate_langs, langs_to_ids
@@ -237,30 +235,19 @@ def generate_with_references(
     )
 
 def langs_to_ids(langs: List[str]):
-    unique_langs = list(set(langs))
-    _, lang_tokens = lang_tokenize("", unique_langs)
-    return lang_tokens
+    # Simplified version that doesn't rely on surya
+    return list(set(langs))
 
 def replace_langs_with_codes(langs):
-    if settings.OCR_ENGINE == "surya":
-        for i, lang in enumerate(langs):
-            if lang.title() in LANGUAGE_TO_CODE:
-                langs[i] = LANGUAGE_TO_CODE[lang.title()]
-    else:
-        for i, lang in enumerate(langs):
-            if lang in LANGUAGE_TO_CODE:
-                langs[i] = LANGUAGE_TO_TESSERACT_CODE[lang]
+    for i, lang in enumerate(langs):
+        if lang in LANGUAGE_TO_TESSERACT_CODE:
+            langs[i] = LANGUAGE_TO_TESSERACT_CODE[lang]
     return langs
 
 def validate_langs(langs):
-    if settings.OCR_ENGINE == "surya":
-        for lang in langs:
-            if lang not in CODE_TO_LANGUAGE:
-                raise ValueError(f"Invalid language code {lang} for Surya OCR")
-    else:
-        for lang in langs:
-            if lang not in TESSERACT_CODE_TO_LANGUAGE:
-                raise ValueError(f"Invalid language code {lang} for Tesseract")
+    for lang in langs:
+        if lang not in TESSERACT_CODE_TO_LANGUAGE:
+            raise ValueError(f"Invalid language code {lang} for OCR")
 
 # --- Streamlit App ---
 st.title("Enhanced PDF to Markdown Converter & Report Generator")
