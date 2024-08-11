@@ -1,3 +1,5 @@
+from typing import List, Dict, Optional, Literal, Tuple
+from PIL import Image
 import streamlit as st
 import os
 import tempfile
@@ -6,10 +8,12 @@ import time
 import requests
 import openai
 import copy
-from typing import List, Dict, Optional, Literal, Tuple
-from PIL import Image
 
-from marker.pdf.utils import validate_langs, find_filetype, replace_langs_with_codes
+from surya.languages import CODE_TO_LANGUAGE, LANGUAGE_TO_CODE
+from surya.model.recognition.tokenizer import tokenize as lang_tokenize
+from marker.ocr.tesseract import LANGUAGE_TO_TESSERACT_CODE, TESSERACT_CODE_TO_LANGUAGE
+from marker.settings import settings
+from marker.pdf.utils import replace_langs_with_codes, validate_langs, langs_to_ids
 from marker.pdf.extract_text import get_text_blocks
 from marker.ocr.recognition import run_ocr
 from marker.layout.layout import annotate_block_types
@@ -29,7 +33,6 @@ from marker.images.save import images_to_dict
 from marker.convert import convert_single_pdf
 from marker.models import load_all_models
 from marker.output import markdown_exists, save_markdown
-from marker.settings import settings
 from marker.title_page import generate_title_page
 from marker.toc import generate_table_of_contents
 from marker.citations import extract_citations, format_citations
@@ -232,6 +235,32 @@ def generate_with_references(
         temperature=temperature,
         max_tokens=max_tokens,
     )
+
+def langs_to_ids(langs: List[str]):
+    unique_langs = list(set(langs))
+    _, lang_tokens = lang_tokenize("", unique_langs)
+    return lang_tokens
+
+def replace_langs_with_codes(langs):
+    if settings.OCR_ENGINE == "surya":
+        for i, lang in enumerate(langs):
+            if lang.title() in LANGUAGE_TO_CODE:
+                langs[i] = LANGUAGE_TO_CODE[lang.title()]
+    else:
+        for i, lang in enumerate(langs):
+            if lang in LANGUAGE_TO_CODE:
+                langs[i] = LANGUAGE_TO_TESSERACT_CODE[lang]
+    return langs
+
+def validate_langs(langs):
+    if settings.OCR_ENGINE == "surya":
+        for lang in langs:
+            if lang not in CODE_TO_LANGUAGE:
+                raise ValueError(f"Invalid language code {lang} for Surya OCR")
+    else:
+        for lang in langs:
+            if lang not in TESSERACT_CODE_TO_LANGUAGE:
+                raise ValueError(f"Invalid language code {lang} for Tesseract")
 
 # --- Streamlit App ---
 st.title("Enhanced PDF to Markdown Converter & Report Generator")
