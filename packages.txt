@@ -1,4 +1,4 @@
 libgl1-mesa-glx
-libgstreamer1.0-0 
-gstreamer1.0-plugins-base 
+libgstreamer1.0-0
+gstreamer1.0-plugins-base
 gstreamer1.0-plugins-good
