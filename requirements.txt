@@ -5,3 +5,4 @@ streamlit
 requests
 openai
 datasets
+surya
