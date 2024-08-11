@@ -6,7 +6,7 @@ import time
 import requests
 import openai
 import copy
-from typing import List, Dict, Optional, Literal
+from typing import List, Dict, Optional, Literal, Tuple
 from PIL import Image
 
 import pypdfium2 as pdfium  # Needs to be imported early to avoid warnings
