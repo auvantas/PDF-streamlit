@@ -1,0 +1,6 @@
+pypdfium2
+marker-pdf
+pillow
+streamlit
+requests
+openai
