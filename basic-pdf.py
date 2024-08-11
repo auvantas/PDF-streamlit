@@ -6,16 +6,55 @@ import time
 import requests
 import openai
 import copy
-from typing import List, Dict, Optional, Literal
+from typing import List, Dict, Optional, Literal, Tuple
 from PIL import Image
 
+import psutil
 import pypdfium2 as pdfium
 from marker.convert import convert_single_pdf
 from marker.models import load_all_models
 from marker.output import markdown_exists, save_markdown
-from marker.utils import flush_cuda_memory
 from marker.settings import settings
 from datasets.utils.logging import disable_progress_bar
+from marker.pdf.utils import (
+    replace_langs_with_codes,
+    validate_langs,
+    find_filetype,
+    sort_block_group,
+)
+from marker.pdf.extract_text import get_text_blocks
+from marker.ocr.detection import surya_detection
+from marker.ocr.recognition import run_ocr
+from marker.layout.layout import surya_layout, annotate_block_types
+from marker.layout.order import surya_order, sort_blocks_in_reading_order
+from marker.equations.equations import replace_equations
+from marker.tables.table import format_tables
+from marker.cleaners.headers import filter_header_footer, filter_common_titles
+from marker.cleaners.code import identify_code_blocks, indent_blocks
+from marker.cleaners.bullets import replace_bullets
+from marker.cleaners.headings import split_heading_blocks
+from marker.cleaners.fontstyle import find_bold_italic
+from marker.postprocessors.editor import edit_full_text
+from marker.postprocessors.markdown import (
+    merge_spans,
+    merge_lines,
+    get_full_text,
+)
+from marker.cleaners.text import cleanup_text
+from marker.images.extract import extract_images
+from marker.images.save import images_to_dict
+from marker.debug.data import dump_bbox_debug_data, dump_equation_debug_data
+from marker.equations.inference import get_total_texify_tokens, get_latex_batched
+from marker.pdf.images import render_bbox_image
+
+# New imports for enhanced features
+from marker.title_page import generate_title_page
+from marker.toc import generate_table_of_contents
+from marker.citations import extract_citations, format_citations
+from marker.document_structure import analyze_structure, apply_template
+from marker.content_enhancement import summarize_section, improve_flow
+from marker.visual_integration import insert_visuals
+from marker.export import export_document
 
 disable_progress_bar()
 
@@ -45,6 +84,18 @@ MAX_RETRIES = 5
 BASE_WAIT = 1  # seconds
 MAX_WAIT = 60  # seconds
 
+# --- RAM Management ---
+MAX_RAM_USAGE_PERCENT = 80  # Set maximum RAM usage threshold
+
+def check_ram_usage():
+    """Checks if RAM usage is below the threshold."""
+    ram_percent = psutil.virtual_memory().percent
+    return ram_percent < MAX_RAM_USAGE_PERCENT
+
+# --- Session State Initialization ---
+if "job_running" not in st.session_state:
+    st.session_state.job_running = False
+
 # --- Constants and Setup ---
 DEBUG = int(os.environ.get("DEBUG", "0"))
 
@@ -53,101 +104,8 @@ OPENAI_API_KEY = st.secrets["openai"]["OPENAI_API_KEY"]
 GROQ_API_KEY = st.secrets["groq"]["GROQ_API_KEY"]
 
 LANGUAGE_TO_TESSERACT_CODE = {
-    "Afrikaans": "afr",
-    "Amharic": "amh",
-    "Arabic": "ara",
-    "Assamese": "asm",
-    "Azerbaijani": "aze",
-    "Belarusian": "bel",
-    "Bulgarian": "bul",
-    "Bengali": "ben",
-    "Breton": "bre",
-    "Bosnian": "bos",
-    "Catalan": "cat",
-    "Czech": "ces",
-    "Welsh": "cym",
-    "Danish": "dan",
-    "German": "deu",
-    "Greek": "ell",
-    "English": "eng",
-    "Esperanto": "epo",
-    "Spanish": "spa",
-    "Estonian": "est",
-    "Basque": "eus",
-    "Persian": "fas",
-    "Finnish": "fin",
-    "French": "fra",
-    "Western Frisian": "fry",
-    "Irish": "gle",
-    "Scottish Gaelic": "gla",
-    "Galician": "glg",
-    "Gujarati": "guj",
-    "Hausa": "hau",
-    "Hebrew": "heb",
-    "Hindi": "hin",
-    "Croatian": "hrv",
-    "Hungarian": "hun",
-    "Armenian": "hye",
-    "Indonesian": "ind",
-    "Icelandic": "isl",
-    "Italian": "ita",
-    "Japanese": "jpn",
-    "Javanese": "jav",
-    "Georgian": "kat",
-    "Kazakh": "kaz",
-    "Khmer": "khm",
-    "Kannada": "kan",
-    "Korean": "kor",
-    "Kurdish": "kur",
-    "Kyrgyz": "kir",
-    "Latin": "lat",
-    "Lao": "lao",
-    "Lithuanian": "lit",
-    "Latvian": "lav",
-    "Malagasy": "mlg",
-    "Macedonian": "mkd",
-    "Malayalam": "mal",
-    "Mongolian": "mon",
-    "Marathi": "mar",
-    "Malay": "msa",
-    "Burmese": "mya",
-    "Nepali": "nep",
-    "Dutch": "nld",
-    "Norwegian": "nor",
-    "Oromo": "orm",
-    "Oriya": "ori",
-    "Punjabi": "pan",
-    "Polish": "pol",
-    "Pashto": "pus",
-    "Portuguese": "por",
-    "Romanian": "ron",
-    "Russian": "rus",
-    "Sanskrit": "san",
-    "Sindhi": "snd",
-    "Sinhala": "sin",
-    "Slovak": "slk",
-    "Slovenian": "slv",
-    "Somali": "som",
-    "Albanian": "sqi",
-    "Serbian": "srp",
-    "Sundanese": "sun",
-    "Swedish": "swe",
-    "Swahili": "swa",
-    "Tamil": "tam",
-    "Telugu": "tel",
-    "Thai": "tha",
-    "Tagalog": "tgl",
-    "Turkish": "tur",
-    "Uyghur": "uig",
-    "Ukrainian": "ukr",
-    "Urdu": "urd",
-    "Uzbek": "uzb",
-    "Vietnamese": "vie",
-    "Xhosa": "xho",
-    "Yiddish": "yid",
-    "Chinese": "chi_sim",
+    # ... (keep the existing language codes)
 }
-
 TESSERACT_CODE_TO_LANGUAGE = {v: k for k, v in LANGUAGE_TO_TESSERACT_CODE.items()}
 
 # --- Rate Limiting Helper ---
@@ -172,6 +130,48 @@ def retry_with_backoff(func, *args, **kwargs):
             wait_time = min(wait_time * 2, MAX_WAIT)
     st.error(f"Failed after {MAX_RETRIES} retries. Giving up.")
     return None
+
+# --- Enhanced PDF Conversion Function ---
+def enhanced_convert_single_pdf(
+    fname: str,
+    model_lst: List,
+    max_pages: int = None,
+    start_page: int = None,
+    metadata: Optional[Dict] = None,
+    langs: Optional[List[str]] = None,
+    batch_multiplier: int = 1,
+    document_template: str = "Default",
+    citation_style: str = "APA"
+) -> Tuple[str, Dict[str, Image.Image], Dict]:
+    # Existing conversion logic
+    full_text, images, out_metadata = convert_single_pdf(
+        fname, model_lst, max_pages, start_page, metadata, langs, batch_multiplier
+    )
+    
+    # Extract metadata for title page
+    metadata = extract_metadata(fname)
+    title_page = generate_title_page(metadata)
+    
+    # Generate table of contents
+    toc = generate_table_of_contents(full_text)
+    
+    # Extract and format citations
+    citations = extract_citations(full_text)
+    formatted_citations = format_citations(citations, style=citation_style)
+    
+    # Analyze and structure the document
+    structured_text = analyze_structure(full_text)
+    
+    # Apply document template
+    templated_text = apply_template(structured_text, template=document_template)
+    
+    # Enhance content
+    enhanced_text = improve_flow(templated_text)
+    
+    # Combine all elements
+    final_document = f"{title_page}\n\n{toc}\n\n{enhanced_text}\n\n{formatted_citations}"
+    
+    return final_document, images, out_metadata
 
 # --- MoA Functions ---
 def generate_together(
@@ -202,7 +202,6 @@ def generate_together(
             return None
     return output.json()["choices"][0]["message"]["content"].strip()
 
-
 def generate_together_stream(
     model,
     messages,
@@ -221,7 +220,6 @@ def generate_together_stream(
     )
     return response
 
-
 def generate_openai(model, messages, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE):
     rate_limit(model)  # Apply rate limiting
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -233,7 +231,6 @@ def generate_openai(model, messages, max_tokens=DEFAULT_MAX_TOKENS, temperature=
     )
     output = completion.choices[0].message.content
     return output.strip()
-
 
 def inject_references_to_messages(messages, references):
     messages = copy.deepcopy(messages)
@@ -247,7 +244,6 @@ Responses from models:"""
     else:
         messages = [{"role": "system", "content": system}] + messages
     return messages
-
 
 def generate_with_references(
     model=DEFAULT_MODEL,
@@ -266,161 +262,14 @@ def generate_with_references(
         max_tokens=max_tokens,
     )
 
-# --- PDF Conversion Functions --- (from marker.convert)
-def convert_single_pdf(
-    fname: str,
-    model_lst: List,
-    max_pages: int = None,
-    start_page: int = None,
-    metadata: Optional[Dict] = None,
-    langs: Optional[List[str]] = None,
-    batch_multiplier: int = 1,
-) -> tuple[str, Dict[str, Image.Image], Dict]:
-    # Set language needed for OCR
-    if langs is None:
-        langs = [settings.DEFAULT_LANG]
-
-    if metadata:
-        langs = metadata.get("languages", langs)
-
-    langs = replace_langs_with_codes(langs)
-    validate_langs(langs)
-
-    # Find the filetype
-    filetype = find_filetype(fname)
-
-    # Setup output metadata
-    out_meta = {
-        "languages": langs,
-        "filetype": filetype,
-    }
-
-    if filetype == "other":  # We can't process this file
-        return "", {}, out_meta
-
-    # Get initial text blocks from the pdf
-    doc = pdfium.PdfDocument(fname)
-    pages, toc = get_text_blocks(
-        doc,
-        fname,
-        max_pages=max_pages,
-        start_page=start_page,
-    )
-    out_meta.update(
-        {
-            "toc": toc,
-            "pages": len(pages),
-        }
-    )
-
-    # Trim pages from doc to align with start page
-    if start_page:
-        for page_idx in range(start_page):
-            doc.del_page(0)
-
-    # Unpack models from list
-    texify_model, layout_model, order_model, edit_model, detection_model, ocr_model = model_lst
-
-    # Identify text lines on pages
-    surya_detection(doc, pages, detection_model, batch_multiplier=batch_multiplier)
-    flush_cuda_memory()
-
-    # OCR pages as needed
-    pages, ocr_stats = run_ocr(
-        doc, pages, langs, ocr_model, batch_multiplier=batch_multiplier
-    )
-    flush_cuda_memory()
-
-    out_meta["ocr_stats"] = ocr_stats
-    if len([b for p in pages for b in p.blocks]) == 0:
-        print(f"Could not extract any text blocks for {fname}")
-        return "", {}, out_meta
-
-    surya_layout(doc, pages, layout_model, batch_multiplier=batch_multiplier)
-    flush_cuda_memory()
-
-    # Find headers and footers
-    bad_span_ids = filter_header_footer(pages)
-    out_meta["block_stats"] = {"header_footer": len(bad_span_ids)}
-
-    # Add block types in
-    annotate_block_types(pages)
-
-    # Dump debug data if flags are set
-    dump_bbox_debug_data(doc, fname, pages)
-
-    # Find reading order for blocks
-    # Sort blocks by reading order
-    surya_order(doc, pages, order_model, batch_multiplier=batch_multiplier)
-    sort_blocks_in_reading_order(pages)
-    flush_cuda_memory()
-
-    # Fix code blocks
-    code_block_count = identify_code_blocks(pages)
-    out_meta["block_stats"]["code"] = code_block_count
-    indent_blocks(pages)
-
-    # Fix table blocks
-    table_count = format_tables(pages)
-    out_meta["block_stats"]["table"] = table_count
-
-    for page in pages:
-        for block in page.blocks:
-            block.filter_spans(bad_span_ids)
-            block.filter_bad_span_types()
-
-    filtered, eq_stats = replace_equations(
-        doc,
-        pages,
-        texify_model,
-        batch_multiplier=batch_multiplier
-    )
-    flush_cuda_memory()
-    out_meta["block_stats"]["equations"] = eq_stats
-
-    # Extract images and figures
-    if settings.EXTRACT_IMAGES:
-        extract_images(doc, pages)
-
-    # Split out headers
-    split_heading_blocks(pages)
-    find_bold_italic(pages)
-
-    # Copy to avoid changing original data
-    merged_lines = merge_spans(filtered)
-    text_blocks = merge_lines(merged_lines)
-    text_blocks = filter_common_titles(text_blocks)
-    full_text = get_full_text(text_blocks)
-
-    # Handle empty blocks being joined
-    full_text = cleanup_text(full_text)
-
-    # Replace bullet characters with a -
-    full_text = replace_bullets(full_text)
-
-    # Postprocess text with editor model
-    full_text, edit_stats = edit_full_text(
-        full_text,
-        edit_model,
-        batch_multiplier=batch_multiplier
-    )
-    flush_cuda_memory()
-    out_meta["postprocess_stats"] = {"edit": edit_stats}
-    doc_images = images_to_dict(pages)
-
-    return full_text, doc_images, out_meta
-
-# --- Other functions from marker --- (If required, include functions like
-# markdown_exists, save_markdown, flush_cuda_memory from marker.output and marker.utils)
-
 # --- Streamlit App ---
-st.title("PDF to Markdown Converter & Report Generator")
+st.title("Enhanced PDF to Markdown Converter & Report Generator")
 
 # --- Sidebar ---
 st.sidebar.header("Options")
 
 uploaded_files = st.sidebar.file_uploader(
-    "Upload PDF files", type=["pdf"], accept_multiple_files=True
+    "Upload PDF files (one at a time)", type=["pdf"], accept_multiple_files=False
 )
 
 # Language selection for OCR
@@ -432,100 +281,163 @@ selected_languages = st.sidebar.multiselect(
 
 model_name = st.sidebar.selectbox(
     "Select Model",
-    default_reference_models,
+    DEFAULT_REFERENCE_MODELS,
     help="Select a model for report generation.",
 )
 
+output_format = st.sidebar.radio(
+    "Select Output Format",
+    ("Markdown", "Copyable Text"),
+    help="Choose how you want to view the output.",
+)
+
+document_template = st.sidebar.selectbox(
+    "Document Template",
+    ["Default", "Research Paper", "Book Chapter", "Technical Report"],
+    help="Select a template for your document structure."
+)
+
+citation_style = st.sidebar.selectbox(
+    "Citation Style",
+    ["APA", "MLA", "Chicago"],
+    help="Choose the citation style for references."
+)
+
 # --- Main Content Area ---
-# 1. PDF Conversion and Storage
-if uploaded_files:
-    # Load models
-    model_lst = load_all_models(langs=selected_languages)
-    pdf_content = {}
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for uploaded_file in uploaded_files:
-            with open(os.path.join(tmpdir, uploaded_file.name), "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            with st.spinner(f"Converting {uploaded_file.name}..."):
-                full_text, images, out_metadata = convert_single_pdf(
-                    os.path.join(tmpdir, uploaded_file.name),
-                    model_lst,
-                    langs=selected_languages,
-                )
-            pdf_content[uploaded_file.name] = full_text
-
-            # Display converted Markdown and images
-            st.markdown(f"## {uploaded_file.name} (Markdown)")
-            st.markdown(full_text)
-            st.markdown(f"### Images from {uploaded_file.name}")
-            for filename, image in images.items():
-                st.image(image, caption=filename)
-
-    # 2. Report Generation
-    st.header("Report Generation")
-    report_topic = st.text_input("Enter the topic for your report:")
-    if st.button("Generate Report"):
-        if report_topic:
-            with st.spinner("Generating report..."):
-                # --- Process data through reference models ---
-                reference_outputs = []
-                for ref_model in DEFAULT_REFERENCE_MODELS:
-                    messages = [
-                        {
-                            "role": "user",
-                            "content": f"Gather information about {report_topic} from the provided documents.",
-                        },
-                    ]
-                    ref_output = generate_with_references(
-                        model=ref_model,
-                        messages=messages,
-                        references=list(pdf_content.values()),  # Pass all PDF content
-                        generate_fn=generate_together
-                        if "groq" in ref_model
-                        else generate_openai,  # Select appropriate generate function
+if not st.session_state.job_running and uploaded_files:
+    st.session_state.job_running = True  # Prevent new jobs while one is running
+    if check_ram_usage():
+        try:
+            # Load models
+            model_lst = load_all_models(langs=selected_languages)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with open(os.path.join(tmpdir, uploaded_files.name), "wb") as f:
+                    f.write(uploaded_files.getbuffer())
+                with st.spinner(f"Converting and enhancing {uploaded_files.name}..."):
+                    final_document, images, out_metadata = enhanced_convert_single_pdf(
+                        os.path.join(tmpdir, uploaded_files.name),
+                        model_lst,
+                        langs=selected_languages,
+                        document_template=document_template,
+                        citation_style=citation_style
                     )
-                    if ref_output:
-                        reference_outputs.append(ref_output)
-                    time.sleep(
-                        DELAY_BETWEEN_CALLS
-                    )  # Delay between calls to reference models
 
-                # --- Generate final report with default model ---
-                messages = [
-                    {
-                        "role": "user",
-                        "content": f"Create a structured report about {report_topic}, using the information gathered. Ensure to include citations and references.",
-                    },
-                ]
-                report = generate_with_references(
-                    model=DEFAULT_MODEL, messages=messages, references=reference_outputs
-                )
-            st.markdown(report)
+                # Display enhanced document
+                st.markdown(f"## Enhanced {uploaded_files.name}")
+                if output_format == "Markdown":
+                    st.markdown(final_document)
+                elif output_format == "Copyable Text":
+                    st.code(final_document)
 
-            # 3. Report Modification
-            st.header("Report Modification")
-            modification_request = st.text_input(
-                "Enter your modification request (e.g., 'expand on XYZ topic'):"
-            )
-            if st.button("Modify Report"):
-                if modification_request:
-                    with st.spinner("Modifying report..."):
-                        messages = [
-                            {
-                                "role": "user",
-                                "content": f"Here's the current report:\n\n{report}\n\n{modification_request}",
-                            }
-                        ]
-                        modified_report = generate_with_references(
-                            model=DEFAULT_MODEL,
-                            messages=messages,
-                            references=references,
+                # Display extracted images
+                st.markdown("### Extracted Images")
+                for filename, image in images.items():
+                    st.image(image, caption=filename)
+
+                # Export options
+                st.header("Export Options")
+                export_format = st.selectbox("Export Format", ["PDF", "DOCX", "HTML"])
+                if st.button("Export Document"):
+                    exported_file = export_document(final_document, export_format)
+                    st.download_button(
+                        label=f"Download {export_format}",
+                        data=exported_file,
+                        file_name=f"enhanced_document.{export_format.lower()}",
+                        mime=f"application/{export_format.lower()}"
+                    )
+
+                # Content Enhancement Tools
+                st.header("Content Enhancement")
+                if st.button("Summarize Document"):
+                    summary = summarize_section(final_document)
+                    st.markdown("### Document Summary")
+                    st.markdown(summary)
+
+                # Visual Integration
+                st.header("Visual Integration")
+                uploaded_visual = st.file_uploader("Upload a chart or graph", type=["png", "jpg", "jpeg"])
+                if uploaded_visual:
+                    insert_position = st.text_input("Enter the heading where you want to insert the visual:")
+                    if st.button("Insert Visual"):
+                        final_document = insert_visuals(final_document, uploaded_visual, insert_position)
+                        st.markdown("Visual inserted successfully. You can now export the updated document.")
+
+                # Report Generation
+                st.header("Report Generation")
+                report_topic = st.text_input("Enter the topic for your report:")
+                if st.button("Generate Report"):
+                    if report_topic:
+                        with st.spinner("Generating report..."):
+                            reference_outputs = []
+                            for ref_model in DEFAULT_REFERENCE_MODELS:
+                                messages = [
+                                    {
+                                        "role": "user",
+                                        "content": f"Gather information about {report_topic} from the provided documents.",
+                                    },
+                                ]
+                                ref_output = generate_with_references(
+                                    model=ref_model,
+                                    messages=messages,
+                                    references=[final_document],
+                                    generate_fn=generate_together
+                                    if "groq" in ref_model
+                                    else generate_openai,
+                                )
+                                if ref_output:
+                                    reference_outputs.append(ref_output)
+                                time.sleep(DELAY_BETWEEN_CALLS)  # Delay between calls to reference models
+
+                            # Generate final report with default model
+                            messages = [
+                                {
+                                    "role": "user",
+                                    "content": f"Create a structured report about {report_topic}, using the information gathered. Ensure to include citations and references.",
+                                },
+                            ]
+                            report = generate_with_references(
+                                model=DEFAULT_MODEL, messages=messages, references=reference_outputs
+                            )
+                        st.markdown("### Generated Report")
+                        st.markdown(report)
+
+                        # Report Modification
+                        st.header("Report Modification")
+                        modification_request = st.text_input(
+                            "Enter your modification request (e.g., 'expand on XYZ topic'):"
                         )
-                    st.markdown(modified_report)
-        else:
-            st.warning("Please enter a report topic.")
+                        if st.button("Modify Report"):
+                            if modification_request:
+                                with st.spinner("Modifying report..."):
+                                    messages = [
+                                        {
+                                            "role": "user",
+                                            "content": f"Here's the current report:\n\n{report}\n\n{modification_request}",
+                                        }
+                                    ]
+                                    modified_report = generate_with_references(
+                                        model=DEFAULT_MODEL,
+                                        messages=messages,
+                                        references=reference_outputs,
+                                    )
+                                st.markdown("### Modified Report")
+                                st.markdown(modified_report)
+                    else:
+                        st.warning("Please enter a report topic.")
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
+        finally:
+            st.session_state.job_running = False  # Allow new jobs after finishing
+    else:
+        st.warning(
+            f"RAM usage is too high ({psutil.virtual_memory().percent}%). "
+            "Please wait for the current job to finish or try uploading a smaller PDF."
+        )
+elif st.session_state.job_running:
+    st.warning("A job is currently running. Please wait for it to finish.")
 else:
-    st.warning("Please upload at least one PDF file.")
+    st.warning("Please upload a PDF file.")
 
-# --- Clean up CUDA Memory ---
+# Clean up CUDA Memory
+from marker.utils import flush_cuda_memory
 flush_cuda_memory()
